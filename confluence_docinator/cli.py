@@ -149,6 +149,23 @@ def _resolve_url(args, storage=None) -> str:
     sys.exit(1)
 
 
+def _resolve_path_arg(path: str) -> str:
+    """Resolve a user-supplied path argument against cwd.
+
+    When a user runs docinator from a parent directory and passes a path like
+    ``confluence_pages/Foo.md``, this normalises it to the absolute path so
+    that sync methods (which join against the repo root) find the file.
+
+    Returns the absolute path string when it exists on disk, otherwise returns
+    the original value unchanged (so existing callers that pass correct
+    relative paths remain unaffected).
+    """
+    p = Path(path)
+    if not p.is_absolute():
+        p = Path.cwd() / path
+    return str(p) if p.exists() else path
+
+
 def cmd_init(args):
     """Initialize a new docinator repository."""
     config = load_config()
@@ -267,7 +284,11 @@ def cmd_push(args):
 
     sync = SyncManager(client, storage)
 
-    print(f"Pushing: {args.path}")
+    # Normalise path against cwd — handles 'confluence_pages/Foo.md' passed
+    # from a parent directory, where storage.root IS confluence_pages/.
+    push_path = _resolve_path_arg(args.path)
+
+    print(f"Pushing: {push_path}")
     if args.message:
         print(f"Message: {args.message}")
     print()
@@ -277,7 +298,7 @@ def cmd_push(args):
 
     try:
         result = sync.push(
-            args.path,
+            push_path,
             message=args.message,
             force=args.force,
             progress_callback=progress,
@@ -329,7 +350,8 @@ def cmd_diff(args):
 
     sync = SyncManager(client, storage)
 
-    path = args.path if args.path else None
+    # Normalise optional path arg against cwd (same fix as cmd_push)
+    path = _resolve_path_arg(args.path) if args.path else None
     recursive = args.recursive
 
     # Helper: make a file path relative to cwd so copy-pasted commands work
@@ -522,10 +544,12 @@ def cmd_resolve(args):
 
     sync = SyncManager(client, storage)
 
-    print(f"Resolving: {args.path}")
+    resolve_path = _resolve_path_arg(args.path)
+
+    print(f"Resolving: {resolve_path}")
     print(f"Strategy: {args.strategy}")
 
-    success, message = sync.resolve_conflict(args.path, args.strategy)
+    success, message = sync.resolve_conflict(resolve_path, args.strategy)
 
     if success:
         print(color(f"Success: {message}", Colors.GREEN))
@@ -924,7 +948,8 @@ def cmd_new(args):
             print(f"  File saved locally. Run:")
             print(f'  docinator create "{rel_path}"')
     else:
-        print(f"  Run 'docinator create \"{rel_path}\"' when ready to publish.")
+        print(
+            f"  Run 'docinator create \"{rel_path}\"' when ready to publish.")
 
 
 def cmd_create(args):
@@ -941,7 +966,8 @@ def cmd_create(args):
         sys.exit(1)
 
     # Resolve path to absolute, then make relative to repo root
-    abs_path = Path(args.path) if Path(args.path).is_absolute() else Path.cwd() / args.path
+    abs_path = Path(args.path) if Path(
+        args.path).is_absolute() else Path.cwd() / args.path
     try:
         rel_path = str(abs_path.relative_to(repo_root))
     except ValueError:
