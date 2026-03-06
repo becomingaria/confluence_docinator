@@ -857,6 +857,124 @@ def cmd_test(args):
         sys.exit(1)
 
 
+def cmd_new(args):
+    """Scaffold a new local .md stub and immediately publish it to Confluence."""
+    config = load_config()
+    client = ConfluenceClient(config)
+    repo_root = _find_repo_root()
+    storage = StorageManager(repo_root)
+    content_format = storage.get_content_format()
+    storage = StorageManager(repo_root, content_format=content_format)
+
+    if not storage.is_initialized():
+        print(color("Error: Not a docinator repository.", Colors.RED))
+        sys.exit(1)
+
+    # Determine target directory
+    if args.dir:
+        target_dir = Path(args.dir)
+        if not target_dir.is_absolute():
+            target_dir = repo_root / args.dir
+    elif args.parent:
+        parent_abs = Path(args.parent)
+        if not parent_abs.is_absolute():
+            parent_abs = Path.cwd() / args.parent
+        target_dir = parent_abs.parent
+    else:
+        # Default to cwd when cwd is inside the repo root, otherwise repo root itself
+        try:
+            Path.cwd().relative_to(repo_root)
+            target_dir = Path.cwd()
+        except ValueError:
+            target_dir = repo_root
+
+    # Sanitise title to a safe filename
+    safe_name = re.sub(r'[<>:"/\\|?*]', "_", args.title)
+    ext = ".md"
+    file_path = target_dir / f"{safe_name}{ext}"
+
+    if file_path.exists():
+        print(color(f"File already exists: {file_path}", Colors.YELLOW))
+        sys.exit(1)
+
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text(f"# {args.title}\n\n", encoding="utf-8")
+
+    try:
+        rel_path = str(file_path.relative_to(repo_root))
+    except ValueError:
+        rel_path = str(file_path)
+
+    print(color(f"Created local file: {file_path}", Colors.GREEN))
+
+    if not args.no_create:
+        sync = SyncManager(client, storage)
+        parent_path = args.parent if args.parent else None
+        success, msg, url = sync.create_new_page(
+            rel_path,
+            title=args.title,
+            parent_path=parent_path,
+        )
+        if success:
+            print(color(f"✓ {msg}", Colors.GREEN))
+            if url:
+                print(f"  {url}")
+        else:
+            print(color(f"✗ {msg}", Colors.RED))
+            print(f"  File saved locally. Run:")
+            print(f'  docinator create "{rel_path}"')
+    else:
+        print(f"  Run 'docinator create \"{rel_path}\"' when ready to publish.")
+
+
+def cmd_create(args):
+    """Publish an existing local .md file as a new Confluence page."""
+    config = load_config()
+    client = ConfluenceClient(config)
+    repo_root = _find_repo_root()
+    storage = StorageManager(repo_root)
+    content_format = storage.get_content_format()
+    storage = StorageManager(repo_root, content_format=content_format)
+
+    if not storage.is_initialized():
+        print(color("Error: Not a docinator repository.", Colors.RED))
+        sys.exit(1)
+
+    # Resolve path to absolute, then make relative to repo root
+    abs_path = Path(args.path) if Path(args.path).is_absolute() else Path.cwd() / args.path
+    try:
+        rel_path = str(abs_path.relative_to(repo_root))
+    except ValueError:
+        rel_path = args.path
+
+    if not abs_path.exists():
+        print(color(f"Error: File not found: {abs_path}", Colors.RED))
+        sys.exit(1)
+
+    title = args.title if args.title else abs_path.stem.replace("_", " ")
+
+    print(f"Creating page: {color(title, Colors.CYAN)}")
+    if args.parent:
+        print(f"  Parent: {args.parent}")
+    print()
+
+    sync = SyncManager(client, storage)
+    success, msg, url = sync.create_new_page(
+        rel_path,
+        title=title,
+        parent_path=args.parent if args.parent else None,
+        message=args.message if hasattr(args, "message") else None,
+    )
+
+    if success:
+        print(color(f"✓ {msg}", Colors.GREEN))
+        if url:
+            print(f"  {url}")
+    else:
+        print(color(f"✗ {msg}", Colors.RED))
+        sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Confluence Docinator - Sync Confluence pages with local files",
@@ -907,7 +1025,8 @@ Examples:
     # push command
     push_parser = subparsers.add_parser(
         "push", help="Push local changes to Confluence")
-    push_path = push_parser.add_argument("path", help="File or directory to push")
+    push_path = push_parser.add_argument(
+        "path", help="File or directory to push")
     push_parser.add_argument("-m", "--message", help="Version message")
     push_parser.add_argument(
         "-f", "--force", action="store_true", help="Force push even with conflicts")
@@ -940,12 +1059,50 @@ Examples:
                                 help="Resolution strategy: local (keep yours), remote (use theirs), merge (manual)")
     resolve_parser.set_defaults(func=cmd_resolve)
 
+    # new command: scaffold + publish a brand-new page
+    new_parser = subparsers.add_parser(
+        "new",
+        help="Create a new page (scaffold a .md file and publish it to Confluence)")
+    new_parser.add_argument("title", help="Page title")
+    new_parser.add_argument(
+        "--parent",
+        metavar="PATH",
+        help="Path to parent page .md file — determines where the page lives in Confluence")
+    new_parser.add_argument(
+        "--dir",
+        metavar="DIR",
+        help="Local directory to create the .md file in (overrides --parent location)")
+    new_parser.add_argument(
+        "--no-create",
+        action="store_true",
+        help="Only create the local file — don't publish to Confluence yet")
+    new_parser.set_defaults(func=cmd_new)
+
+    # create command: publish an existing local file as a new Confluence page
+    create_parser = subparsers.add_parser(
+        "create",
+        help="Publish an existing local .md file as a new Confluence page")
+    create_path = create_parser.add_argument(
+        "path", help="Path to the local .md file to publish")
+    create_parser.add_argument(
+        "--title",
+        help="Override the page title (default: derived from filename)")
+    create_parser.add_argument(
+        "--parent",
+        metavar="PATH",
+        help="Path to parent page .md file (overrides auto-discovery)")
+    create_parser.add_argument(
+        "-m", "--message",
+        help="Version message")
+    create_parser.set_defaults(func=cmd_create)
+
     # Attach file completers to path arguments (argcomplete)
     if _ARGCOMPLETE:
         _fc = FilesCompleter()
         push_path.completer = _fc
         diff_path.completer = _fc
         resolve_path.completer = _fc
+        create_path.completer = _fc
 
     # setup command
     setup_parser = subparsers.add_parser(

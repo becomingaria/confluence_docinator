@@ -855,3 +855,156 @@ class SyncManager:
             "conflicts": conflicts,
             "untracked": local_only,
         }
+
+    # ===================================================================
+    # CREATE OPERATIONS
+    # ===================================================================
+
+    def create_new_page(
+        self,
+        local_path: str,
+        title: Optional[str] = None,
+        parent_path: Optional[str] = None,
+        message: Optional[str] = None,
+    ) -> Tuple[bool, str, Optional[str]]:
+        """Create a new page in Confluence from a local file.
+
+        Args:
+            local_path: Path to the local .md file (absolute or relative to storage root).
+            title: Page title — defaults to filename stem with underscores as spaces.
+            parent_path: Path to parent page file (absolute or relative to storage root).
+                         When omitted, the parent is inferred from sibling pages in the
+                         same directory, or from ``root_page_id`` in the repo config.
+            message: Optional version message (currently unused by the API wrapper).
+
+        Returns:
+            A 3-tuple of ``(success, message, page_url)``.
+        """
+        # Normalise path to absolute
+        full_path = Path(local_path)
+        if not full_path.is_absolute():
+            full_path = self.storage.root / local_path
+        try:
+            rel_path = str(full_path.relative_to(self.storage.root))
+        except ValueError:
+            return False, f"Path is outside the repository root: {local_path}", None
+
+        # Guard: already tracked
+        if self.storage.get_page_by_path(rel_path):
+            return False, "File is already tracked in the index. Use 'push' to update it.", None
+
+        # Derive title from filename if not supplied
+        if not title:
+            title = full_path.stem.replace("_", " ")
+
+        # Read content — create a minimal stub if the file doesn't exist yet
+        if not full_path.exists():
+            full_path.parent.mkdir(parents=True, exist_ok=True)
+            full_path.write_text(f"# {title}\n\n", encoding="utf-8")
+        local_content = full_path.read_text(encoding="utf-8")
+
+        # ----------------------------------------------------------------
+        # Resolve parent_id
+        # ----------------------------------------------------------------
+        parent_id: Optional[str] = None
+
+        if parent_path:
+            # Explicit parent: look it up by path in the index
+            parent_full = Path(parent_path)
+            if not parent_full.is_absolute():
+                parent_full = self.storage.root / parent_path
+            try:
+                parent_rel = str(parent_full.relative_to(self.storage.root))
+            except ValueError:
+                parent_rel = parent_path
+            parent_meta = self.storage.get_page_by_path(parent_rel)
+            if not parent_meta:
+                return False, f"Parent page not found in index: {parent_path}", None
+            parent_id = parent_meta.page_id
+        else:
+            # Discover parent by looking for a sibling (same directory) in the index
+            file_dir = str(Path(rel_path).parent)
+            index = self.storage.get_index()
+            for pid, info in index.get("pages", {}).items():
+                sibling_dir = str(Path(info["local_path"]).parent)
+                if sibling_dir == file_dir:
+                    meta = self.storage.get_page_metadata(pid)
+                    if meta and meta.parent_id:
+                        parent_id = meta.parent_id
+                        break
+
+            # Fall back to the root page of the repo
+            if not parent_id:
+                config = self.storage.get_config()
+                parent_id = config.get("root_page_id") if config else None
+
+        if not parent_id:
+            return False, (
+                "Could not determine a parent page ID. "
+                "Pass --parent to specify one explicitly."
+            ), None
+
+        # ----------------------------------------------------------------
+        # Gather space key
+        # ----------------------------------------------------------------
+        config = self.storage.get_config()
+        if not config:
+            return False, "Repository config not found.", None
+        space_key = config.get("space_key", "")
+        if not space_key:
+            return False, "No space_key found in repository config.", None
+
+        # ----------------------------------------------------------------
+        # Convert content to XHTML for the Confluence API
+        # ----------------------------------------------------------------
+        content_format = self.storage.get_content_format()
+        if content_format == self.storage.FORMAT_MARKDOWN:
+            xhtml = markdown_to_xhtml(local_content, {})
+        else:
+            xhtml = local_content
+
+        # ----------------------------------------------------------------
+        # Call the API
+        # ----------------------------------------------------------------
+        try:
+            result = self.client.create_page(
+                space_key=space_key,
+                title=title,
+                content=xhtml,
+                parent_id=parent_id,
+            )
+        except Exception as exc:
+            return False, f"Confluence API error: {exc}", None
+
+        new_page_id = result["id"]
+        new_version = result.get("version", {}).get("number", 1)
+        web_url = (
+            result.get("_links", {}).get("base", "")
+            + result.get("_links", {}).get("webui", "")
+        )
+
+        # ----------------------------------------------------------------
+        # Persist metadata locally
+        # ----------------------------------------------------------------
+        metadata = PageMetadata(
+            page_id=new_page_id,
+            title=title,
+            space_key=space_key,
+            version=new_version,
+            last_modified=result.get("version", {}).get("when", ""),
+            last_modified_by=(
+                result.get("version", {}).get("by", {}).get("displayName", "")
+            ),
+            parent_id=parent_id,
+            web_url=web_url,
+            labels=[],
+        )
+
+        dir_path = str(Path(rel_path).parent)
+        self.storage.save_page(
+            local_content,
+            metadata,
+            dir_path if dir_path != "." else "",
+        )
+
+        return True, f"Created page '{title}' (ID: {new_page_id})", web_url or None
