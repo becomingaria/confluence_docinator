@@ -3,6 +3,7 @@
 Confluence Docinator CLI - Sync Confluence pages with local files.
 
 Usage:
+    docinator setup
     docinator pull <url> [--force] [--output <dir>]
     docinator push <path> [--message <msg>] [--force]
     docinator diff [<path>] [--recursive] [--git]
@@ -360,6 +361,11 @@ def cmd_status(args):
     print(f"Space: {status['space_key']}")
     print()
     print(f"Tracked pages: {status['tracked_pages']}")
+    if status.get('tracked_attachments'):
+        print(f"Tracked attachments: {status['tracked_attachments']}")
+    if status.get('pages_with_labels'):
+        print(
+            f"Labels: {status['total_labels']} across {status['pages_with_labels']} pages")
     print()
 
     if status['unchanged']:
@@ -415,6 +421,208 @@ def cmd_resolve(args):
         sys.exit(1)
 
 
+_SETUP_EXAMPLE_ENV = """\
+# Confluence connection
+# Copy this file to .env and fill in your values
+
+# Base URL for Confluence (your instance URL ending with /wiki)
+CONFLUENCE_BASE_URL=https://your-domain.atlassian.net/wiki
+
+# Your Confluence username (usually your email)
+CONFLUENCE_USERNAME=your.email@yourorganization.com
+
+# API token - get one from: https://id.atlassian.com/manage-profile/security/api-tokens
+CONFLUENCE_API_KEY=your-api-token-here
+
+# Default space key (optional, extracted from URLs if not provided)
+CONFLUENCE_SPACE_KEY=YOUR_SPACE
+
+# Editor version (optional, default: 2)
+CONFLUENCE_EDITOR_VERSION=2
+"""
+
+_SETUP_README = """\
+# Confluence Docinator
+
+A CLI tool for syncing Confluence pages with local files, enabling a git-like
+pull / diff / push workflow for documentation management.
+
+## Quick Start
+
+### 1. Configure credentials
+
+Copy `example.env` to `.env` and fill in your values:
+
+```bash
+cp example.env .env
+```
+
+Edit `.env`:
+
+```env
+CONFLUENCE_BASE_URL=https://your-domain.atlassian.net/wiki
+CONFLUENCE_USERNAME=your.email@yourorganization.com
+CONFLUENCE_API_KEY=your-api-token-here
+CONFLUENCE_SPACE_KEY=YOUR_SPACE
+```
+
+**Getting an API token:**
+1. Go to https://id.atlassian.com/manage-profile/security/api-tokens
+2. Click "Create API token", give it a name, and copy the value.
+
+---
+
+## Commands
+
+### Test connection
+
+```bash
+docinator test
+```
+
+### Pull pages
+
+Download all pages from a Confluence folder to `./confluence_pages/`:
+
+```bash
+docinator pull "https://your-domain.atlassian.net/wiki/spaces/SPACE/folder/123456789"
+```
+
+Options:
+- `-o, --output <dir>` – custom output directory
+- `-f, --force` – overwrite local changes without prompting
+- `--format md|xhtml` – file format (default: `md`)
+
+### Check status
+
+```bash
+docinator status
+```
+
+Example output:
+
+```
+Docinator Status
+========================================
+Repository: /path/to/confluence_pages
+Target: https://your-domain.atlassian.net/...
+Space: YOUR_SPACE
+
+Tracked pages: 28
+Labels: 38 across 16 pages
+
+  ● Unchanged: 27
+  ● Local changes: 1
+  ● Remote changes: 0
+  ● Conflicts: 0
+```
+
+### View differences
+
+```bash
+docinator diff                         # all files
+docinator diff path/to/Page.md         # single file
+docinator diff path/to/Page.md --show-diff   # with inline diff
+docinator diff path/to/Page.md --git         # use git diff style
+```
+
+### Push changes
+
+```bash
+docinator push path/to/Page.md
+docinator push path/to/Page.md -m "Updated API docs"
+docinator push path/to/folder/
+docinator push path/to/Page.md --force       # override conflicts
+```
+
+### Resolve conflicts
+
+```bash
+docinator resolve path/to/Page.md --strategy local    # keep your version
+docinator resolve path/to/Page.md --strategy remote   # use Confluence version
+docinator resolve path/to/Page.md --strategy merge    # manual merge file
+```
+
+---
+
+## Typical workflow
+
+```bash
+# 1. Pull documentation
+docinator pull "https://your-domain.atlassian.net/wiki/spaces/SPACE/folder/123456789"
+
+# 2. Edit files locally
+cd confluence_pages/
+# ... edit .md files with any editor ...
+
+# 3. See what changed
+docinator status
+docinator diff path/to/Page.md --show-diff
+
+# 4. Push updates back to Confluence
+docinator push path/to/Page.md -m "Improved installation steps"
+```
+
+---
+
+## Repository structure
+
+```
+confluence_pages/
+├── .confluence/
+│   ├── config.json            # sync configuration
+│   ├── index.json             # page tracking index
+│   ├── pages/{id}.json        # per-page metadata & labels
+│   ├── macros/{id}.json       # preserved Confluence macros
+│   └── attachments/           # attachment metadata
+├── Parent_Page.md
+├── Subfolder/
+│   ├── Child_Page_1.md
+│   └── Child_Page_2.md
+└── _images/
+    └── some_diagram.png
+```
+
+---
+
+## Notes
+
+- Macro-rich content (layouts, ADF extensions, etc.) is preserved as
+  `<!-- CONFLUENCE_MACRO_N: name -->` placeholders in Markdown and
+  restored on push from the macro store in `.confluence/macros/`.
+- Page labels are pulled into metadata and synced back on push.
+- Never edit the `.confluence/` directory manually.
+- Always `diff` before `push` to avoid overwriting others' changes.
+"""
+
+
+def cmd_setup(args):
+    """Create example.env and README.md in the current directory."""
+    cwd = Path.cwd()
+    files = {
+        "example.env": _SETUP_EXAMPLE_ENV,
+        "README.md": _SETUP_README,
+    }
+
+    for filename, content in files.items():
+        target = cwd / filename
+        if target.exists():
+            answer = input(
+                f"  {filename} already exists. Overwrite? [y/N] ").strip().lower()
+            if answer not in ("y", "yes"):
+                print(f"  Skipped {filename}")
+                continue
+
+        target.write_text(content, encoding="utf-8")
+        print(color(f"  Created {target}", Colors.GREEN))
+
+    print()
+    print("Next steps:")
+    print("  1. Copy example.env → .env and fill in your credentials")
+    print("  2. Run: docinator test")
+    print("  3. Run: docinator pull <your-confluence-folder-url>")
+
+
 def cmd_test(args):
     """Test Confluence connection."""
     config = load_config()
@@ -439,13 +647,14 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  docinator init https://wiki.example.com/wiki/spaces/SPACE/folder/123
-  docinator pull https://wiki.example.com/wiki/spaces/SPACE/folder/123
+  docinator setup
+  docinator init https://your-domain.atlassian.net/wiki/spaces/SPACE/folder/123456789
+  docinator pull https://your-domain.atlassian.net/wiki/spaces/SPACE/folder/123456789
   docinator status
   docinator diff
-  docinator diff path/to/file.md --show-diff
-  docinator push path/to/file.md -m "Updated documentation"
-  docinator resolve path/to/file.md --strategy local
+  docinator diff path/to/Page.md --show-diff
+  docinator push path/to/Page.md -m "Updated documentation"
+  docinator resolve path/to/Page.md --strategy local
         """
     )
 
@@ -509,6 +718,12 @@ Examples:
                                 choices=["local", "remote", "merge"],
                                 help="Resolution strategy: local (keep yours), remote (use theirs), merge (manual)")
     resolve_parser.set_defaults(func=cmd_resolve)
+
+    # setup command
+    setup_parser = subparsers.add_parser(
+        "setup",
+        help="Create example.env and README.md in the current directory")
+    setup_parser.set_defaults(func=cmd_setup)
 
     # test command
     test_parser = subparsers.add_parser(

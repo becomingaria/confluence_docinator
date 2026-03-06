@@ -40,8 +40,12 @@ class StorageManager:
     METADATA_DIR = ".confluence"
     PAGES_METADATA_DIR = ".confluence/pages"
     MACROS_DIR = ".confluence/macros"
+    ATTACHMENTS_METADATA_DIR = ".confluence/attachments"
     CONFIG_FILE = ".confluence/config.json"
     INDEX_FILE = ".confluence/index.json"
+
+    # Image directory name (sibling to .md files)
+    IMAGES_DIR_NAME = "_images"
 
     # Supported formats
     FORMAT_XHTML = "xhtml"
@@ -57,6 +61,7 @@ class StorageManager:
         self.metadata_dir = self.root / self.METADATA_DIR
         self.pages_dir = self.metadata_dir / "pages"
         self.macros_dir = self.metadata_dir / "macros"
+        self.attachments_dir = self.metadata_dir / "attachments"
         self.content_format = content_format
         self.CONTENT_EXTENSION = self.EXTENSIONS.get(content_format, ".md")
 
@@ -65,6 +70,7 @@ class StorageManager:
         self.metadata_dir.mkdir(parents=True, exist_ok=True)
         self.pages_dir.mkdir(parents=True, exist_ok=True)
         self.macros_dir.mkdir(parents=True, exist_ok=True)
+        self.attachments_dir.mkdir(parents=True, exist_ok=True)
 
         if content_format:
             self.content_format = content_format
@@ -208,6 +214,137 @@ class StorageManager:
             return config.get("content_format", self.FORMAT_MARKDOWN)
         return self.content_format
 
+    # ========== ATTACHMENT OPERATIONS ==========
+
+    def get_images_dir(self, page_local_path: str) -> Path:
+        """
+        Get the _images directory for a page.
+
+        Images are stored in an _images folder next to the page file,
+        e.g. for 'folder/Page Title.md' -> 'folder/_images/'
+        """
+        page_path = Path(page_local_path)
+        parent_dir = page_path.parent if page_path.parent != Path(
+            '.') else Path('')
+        return self.root / parent_dir / self.IMAGES_DIR_NAME
+
+    def save_attachment(self, page_id: str, filename: str, data: bytes,
+                        page_local_path: str, attachment_meta: Dict[str, Any]) -> str:
+        """
+        Save an attachment file locally and track its metadata.
+
+        Args:
+            page_id: The Confluence page ID
+            filename: The attachment filename
+            data: Raw bytes of the file
+            page_local_path: The local path of the parent page
+            attachment_meta: Attachment metadata from Confluence API
+
+        Returns:
+            Relative path to the saved file
+        """
+        images_dir = self.get_images_dir(page_local_path)
+        images_dir.mkdir(parents=True, exist_ok=True)
+
+        safe_filename = self._sanitize_filename(filename)
+        # Preserve extension
+        if '.' in filename:
+            ext = filename.rsplit('.', 1)[1]
+            base = self._sanitize_filename(filename.rsplit('.', 1)[0])
+            safe_filename = f"{base}.{ext}"
+
+        file_path = images_dir / safe_filename
+        with open(file_path, 'wb') as f:
+            f.write(data)
+
+        relative_path = str(file_path.relative_to(self.root))
+
+        # Save attachment metadata
+        content_hash = hashlib.sha256(data).hexdigest()
+        att_id = attachment_meta.get("id", "")
+        att_version = attachment_meta.get("version", {}).get("number", 1) if isinstance(
+            attachment_meta.get("version"), dict) else 1
+
+        self._save_attachment_metadata(page_id, filename, {
+            "attachment_id": att_id,
+            "filename": filename,
+            "local_path": relative_path,
+            "page_id": page_id,
+            "version": att_version,
+            "content_hash": content_hash,
+            "media_type": attachment_meta.get("metadata", {}).get("mediaType",
+                                                                  attachment_meta.get("mediaType", "")),
+            "file_size": len(data),
+        })
+
+        return relative_path
+
+    def _save_attachment_metadata(self, page_id: str, filename: str, meta: Dict[str, Any]):
+        """Save individual attachment metadata."""
+        self.attachments_dir.mkdir(parents=True, exist_ok=True)
+        page_att_dir = self.attachments_dir / page_id
+        page_att_dir.mkdir(parents=True, exist_ok=True)
+
+        safe_name = self._sanitize_filename(filename)
+        meta_file = page_att_dir / f"{safe_name}.json"
+        with open(meta_file, 'w') as f:
+            json.dump(meta, f, indent=2)
+
+        # Update index
+        index = self.get_index()
+        if "attachments" not in index:
+            index["attachments"] = {}
+        if page_id not in index["attachments"]:
+            index["attachments"][page_id] = {}
+        index["attachments"][page_id][filename] = {
+            "local_path": meta["local_path"],
+            "content_hash": meta["content_hash"],
+            "version": meta["version"],
+        }
+        self.save_index(index)
+
+    def get_attachment_metadata(self, page_id: str, filename: str) -> Optional[Dict[str, Any]]:
+        """Get metadata for a specific attachment."""
+        safe_name = self._sanitize_filename(filename)
+        meta_file = self.attachments_dir / page_id / f"{safe_name}.json"
+        if meta_file.exists():
+            with open(meta_file) as f:
+                return json.load(f)
+        return None
+
+    def get_page_attachments(self, page_id: str) -> Dict[str, Dict[str, Any]]:
+        """Get all attachment metadata for a page. Returns {filename: metadata}."""
+        index = self.get_index()
+        return index.get("attachments", {}).get(page_id, {})
+
+    def read_local_attachment(self, local_path: str) -> Optional[bytes]:
+        """Read a local attachment file."""
+        full_path = self.root / local_path
+        if full_path.exists():
+            with open(full_path, 'rb') as f:
+                return f.read()
+        return None
+
+    def get_local_attachment_hash(self, local_path: str) -> Optional[str]:
+        """Calculate hash of local attachment file."""
+        data = self.read_local_attachment(local_path)
+        if data:
+            return hashlib.sha256(data).hexdigest()
+        return None
+
+    def find_all_image_files(self) -> List[str]:
+        """Find all image files in _images directories."""
+        files = []
+        image_exts = {'.png', '.jpg', '.jpeg', '.gif',
+                      '.svg', '.webp', '.bmp', '.ico', '.pdf'}
+        for images_dir in self.root.rglob(self.IMAGES_DIR_NAME):
+            if self.METADATA_DIR in str(images_dir):
+                continue
+            for file_path in images_dir.iterdir():
+                if file_path.is_file() and (file_path.suffix.lower() in image_exts or True):
+                    files.append(str(file_path.relative_to(self.root)))
+        return files
+
     def get_page_metadata(self, page_id: str) -> Optional[PageMetadata]:
         """Get metadata for a specific page."""
         meta_file = self.pages_dir / f"{page_id}.json"
@@ -243,7 +380,7 @@ class StorageManager:
     def get_local_content_hash(self, local_path: str) -> Optional[str]:
         """Calculate hash of local file content."""
         content = self.read_local_content(local_path)
-        if content:
+        if content is not None:
             return hashlib.sha256(content.encode('utf-8')).hexdigest()
         return None
 
@@ -291,7 +428,8 @@ class StorageManager:
         """Find all content files in the storage."""
         files = []
         for path in self.root.rglob(f"*{self.CONTENT_EXTENSION}"):
-            if self.METADATA_DIR not in str(path):
+            path_str = str(path)
+            if self.METADATA_DIR not in path_str and self.IMAGES_DIR_NAME not in path_str:
                 files.append(str(path.relative_to(self.root)))
         return files
 

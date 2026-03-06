@@ -2,6 +2,7 @@
 Converter module for Confluence XHTML ↔ Markdown conversion.
 
 Handles conversion while preserving Confluence-specific macros where possible.
+Supports local image references for round-trip editing.
 """
 
 import re
@@ -27,10 +28,16 @@ class ConfluenceToMarkdownConverter:
     def __init__(self):
         self.macro_store: Dict[str, str] = {}
         self.macro_counter = 0
+        # filenames referenced in content
+        self.referenced_attachments: List[str] = []
 
-    def convert(self, xhtml: str) -> Tuple[str, Dict[str, str]]:
+    def convert(self, xhtml: str, images_dir: str = "_images") -> Tuple[str, Dict[str, str]]:
         """
         Convert Confluence XHTML to Markdown.
+
+        Args:
+            xhtml: Confluence storage format XHTML
+            images_dir: Relative path to images directory (default: _images)
 
         Returns:
             Tuple of (markdown_content, macro_store)
@@ -38,6 +45,8 @@ class ConfluenceToMarkdownConverter:
         """
         self.macro_store = {}
         self.macro_counter = 0
+        self.referenced_attachments = []
+        self.images_dir = images_dir
 
         if not xhtml or not xhtml.strip():
             return "", {}
@@ -69,24 +78,46 @@ class ConfluenceToMarkdownConverter:
 
         content = self.MACRO_PATTERN.sub(replace_macro, xhtml)
 
-        # Also preserve ac:image tags
+        # Handle ac:image tags - convert to local image references
         image_pattern = re.compile(r'<ac:image[^>]*>.*?</ac:image>', re.DOTALL)
 
         def replace_image(match):
-            self.macro_counter += 1
-            placeholder_id = f"CONFLUENCE_MACRO_{self.macro_counter}"
-            self.macro_store[placeholder_id] = match.group(0)
+            image_html = match.group(0)
 
-            # Try to extract alt text or filename
-            alt_match = re.search(r'ac:alt="([^"]*)"', match.group(0))
-            filename_match = re.search(
-                r'ri:filename="([^"]*)"', match.group(0))
+            # Extract filename from ri:attachment
+            filename_match = re.search(r'ri:filename="([^"]*)"', image_html)
+            # Extract URL from ri:url
+            url_match = re.search(r'ri:value="([^"]*)"', image_html)
+            # Extract alt text
+            alt_match = re.search(r'ac:alt="([^"]*)"', image_html)
 
-            desc = alt_match.group(1) if alt_match else (
-                filename_match.group(1) if filename_match else "image"
-            )
+            if filename_match:
+                # This is an attachment image - reference local file
+                filename = filename_match.group(1)
+                self.referenced_attachments.append(filename)
+                alt = alt_match.group(1) if alt_match else filename
+                local_path = f"{self.images_dir}/{filename}"
 
-            return f"\n\n![{desc}](<!-- {placeholder_id} -->)\n\n"
+                # Store original HTML for round-trip (keyed by filename)
+                self.macro_counter += 1
+                placeholder_id = f"CONFLUENCE_MACRO_{self.macro_counter}"
+                self.macro_store[placeholder_id] = image_html
+                # Store mapping: image filename -> placeholder
+                self.macro_store[f"_IMG_{filename}"] = placeholder_id
+
+                return f"\n\n![{alt}]({local_path})\n\n"
+            elif url_match:
+                # External URL image - keep as markdown image
+                url = url_match.group(1)
+                alt = alt_match.group(1) if alt_match else "image"
+                return f"\n\n![{alt}]({url})\n\n"
+            else:
+                # Unknown image format - preserve as macro
+                self.macro_counter += 1
+                placeholder_id = f"CONFLUENCE_MACRO_{self.macro_counter}"
+                self.macro_store[placeholder_id] = image_html
+                desc = alt_match.group(1) if alt_match else "image"
+                return f"\n\n![{desc}](<!-- {placeholder_id} -->)\n\n"
 
         content = image_pattern.sub(replace_image, content)
 
@@ -128,6 +159,44 @@ class ConfluenceToMarkdownConverter:
             return f"[📎 {filename}](<!-- {placeholder_id} -->)"
 
         content = attachment_pattern.sub(replace_attachment, content)
+
+        # Preserve ac:layout blocks (multi-column layouts)
+        layout_pattern = re.compile(
+            r'<ac:layout\b[^>]*>.*?</ac:layout>', re.DOTALL)
+
+        def replace_layout(match):
+            self.macro_counter += 1
+            placeholder_id = f"CONFLUENCE_MACRO_{self.macro_counter}"
+            self.macro_store[placeholder_id] = match.group(0)
+            return f"\n\n<!-- {placeholder_id}: layout -->\n\n"
+
+        content = layout_pattern.sub(replace_layout, content)
+
+        # Preserve ac:adf-extension blocks (new editor format)
+        adf_pattern = re.compile(
+            r'<ac:adf-extension\b[^>]*>.*?</ac:adf-extension>', re.DOTALL)
+
+        def replace_adf(match):
+            self.macro_counter += 1
+            placeholder_id = f"CONFLUENCE_MACRO_{self.macro_counter}"
+            self.macro_store[placeholder_id] = match.group(0)
+            return f"\n\n<!-- {placeholder_id}: adf-extension -->\n\n"
+
+        content = adf_pattern.sub(replace_adf, content)
+
+        # Preserve ac:inline-comment-marker (inline comment annotations)
+        comment_marker_pattern = re.compile(
+            r'<ac:inline-comment-marker\b[^>]*>(.*?)</ac:inline-comment-marker>', re.DOTALL)
+
+        def replace_comment_marker(match):
+            self.macro_counter += 1
+            placeholder_id = f"CONFLUENCE_MACRO_{self.macro_counter}"
+            self.macro_store[placeholder_id] = match.group(0)
+            # Keep the text content visible, wrap with placeholder
+            inner_text = re.sub(r'<[^>]+>', '', match.group(1))
+            return f"{inner_text}<!-- {placeholder_id}: inline-comment -->"
+
+        content = comment_marker_pattern.sub(replace_comment_marker, content)
 
         return content
 
@@ -437,6 +506,15 @@ class MarkdownToConfluenceConverter:
             if '<!-- CONFLUENCE_MACRO_' in img_url:
                 return match.group(0)  # Keep as-is, will be restored later
 
+            # Check if this is a local _images/ reference (attachment)
+            if '_images/' in img_url:
+                filename = img_url.split('/')[-1]
+                return (
+                    f'<ac:image ac:alt="{alt_text}">'
+                    f'<ri:attachment ri:filename="{filename}"/>'
+                    f'</ac:image>'
+                )
+
             return f'<ac:image><ri:url ri:value="{img_url}"/></ac:image>'
 
         text = re.sub(r'!\[([^\]]*)\]\(([^)]+)\)', convert_image, text)
@@ -485,6 +563,10 @@ class MarkdownToConfluenceConverter:
         """Restore Confluence macros from placeholders."""
 
         for placeholder_id, original_macro in macro_store.items():
+            # Skip internal mapping keys
+            if placeholder_id.startswith("_IMG_"):
+                continue
+
             # Pattern: <!-- PLACEHOLDER_ID: macro_name -->
             pattern = re.compile(f'<!-- {placeholder_id}[^>]* -->')
             xhtml = pattern.sub(original_macro, xhtml)
@@ -500,15 +582,37 @@ class MarkdownToConfluenceConverter:
                 f'\\[[^\\]]*\\]\\(<!-- {placeholder_id} -->\\)')
             xhtml = link_pattern.sub(original_macro, xhtml)
 
+        # Restore original ac:image HTML for attachment images that have stored originals
+        # This handles cases where the converter generated simple <ac:image> but the original
+        # had extra attributes (alignment, width, etc.)
+        for key, value in macro_store.items():
+            if key.startswith("_IMG_"):
+                filename = key[5:]  # Strip "_IMG_" prefix
+                placeholder_id = value
+                original_html = macro_store.get(placeholder_id, "")
+                if original_html:
+                    # Replace simple ac:image tags for this filename with the original
+                    simple_pattern = re.compile(
+                        f'<ac:image[^>]*>\\s*<ri:attachment ri:filename="{re.escape(filename)}"\\s*/?>\\s*</ac:image>'
+                    )
+                    xhtml = simple_pattern.sub(original_html, xhtml)
+
         return xhtml
 
 
 # Convenience functions
 
-def xhtml_to_markdown(xhtml: str) -> Tuple[str, Dict[str, str]]:
+def xhtml_to_markdown(xhtml: str, images_dir: str = "_images") -> Tuple[str, Dict[str, str]]:
     """Convert Confluence XHTML to Markdown."""
     converter = ConfluenceToMarkdownConverter()
-    return converter.convert(xhtml)
+    return converter.convert(xhtml, images_dir=images_dir)
+
+
+def get_referenced_attachments(xhtml: str) -> List[str]:
+    """Extract list of attachment filenames referenced in XHTML content."""
+    converter = ConfluenceToMarkdownConverter()
+    converter.convert(xhtml)
+    return converter.referenced_attachments
 
 
 def markdown_to_xhtml(markdown: str, macro_store: Dict[str, str] = None) -> str:

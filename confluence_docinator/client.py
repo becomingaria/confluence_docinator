@@ -121,11 +121,17 @@ class ConfluenceClient:
         Returns:
             Tuple of (content_html, metadata)
         """
-        page = self.get_page(page_id)
+        page = self.get_page(page_id, expand=[
+                             "body.storage", "version", "history", "ancestors", "metadata.labels"])
         if not page:
             return None, None
 
         content = page.get("body", {}).get("storage", {}).get("value", "")
+
+        # Extract labels from metadata
+        labels_data = page.get("metadata", {}).get(
+            "labels", {}).get("results", [])
+        labels = [l.get("name", "") for l in labels_data if l.get("name")]
 
         metadata = PageMetadata(
             page_id=page["id"],
@@ -138,6 +144,7 @@ class ConfluenceClient:
             parent_id=page.get(
                 "ancestors", [{}])[-1].get("id") if page.get("ancestors") else None,
             web_url=f"{self.base_url}{page.get('_links', {}).get('webui', '')}",
+            labels=labels,
         )
 
         return content, metadata
@@ -157,11 +164,11 @@ class ConfluenceClient:
             }
 
             response = self.session.get(url, params=params)
-            
+
             # If 404, the parent might be a folder - use CQL search instead
             if response.status_code == 404:
                 return self._get_child_pages_cql(parent_id, limit)
-            
+
             response.raise_for_status()
 
             data = response.json()
@@ -386,6 +393,184 @@ class ConfluenceClient:
         response.raise_for_status()
 
         return response.json()
+
+    # ========== ATTACHMENT OPERATIONS ==========
+
+    def get_attachments(self, page_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+        """
+        Get all attachments for a page.
+
+        Returns:
+            List of attachment metadata dicts with keys:
+            id, title (filename), mediaType, fileSize, _links.download
+        """
+        all_attachments = []
+        start = 0
+
+        while True:
+            url = self._api_v1(f"content/{page_id}/child/attachment")
+            params = {
+                "start": start,
+                "limit": limit,
+                "expand": "version",
+            }
+
+            response = self.session.get(url, params=params)
+            if response.status_code == 404:
+                return []
+            response.raise_for_status()
+
+            data = response.json()
+            results = data.get("results", [])
+            all_attachments.extend(results)
+
+            if len(results) < limit:
+                break
+            start += limit
+
+        return all_attachments
+
+    def download_attachment(self, download_url: str) -> bytes:
+        """
+        Download an attachment's binary content.
+
+        Args:
+            download_url: The relative download URL from attachment metadata
+
+        Returns:
+            Raw bytes of the attachment
+        """
+        # download_url is relative, e.g. /download/attachments/12345/image.png
+        if download_url.startswith("/"):
+            full_url = f"{self.base_url}{download_url}"
+        else:
+            full_url = download_url
+
+        response = self.session.get(full_url)
+        response.raise_for_status()
+        return response.content
+
+    def upload_attachment(
+        self,
+        page_id: str,
+        filename: str,
+        data: bytes,
+        content_type: str = "application/octet-stream",
+        comment: str = None,
+    ) -> Dict[str, Any]:
+        """
+        Upload or update an attachment on a page.
+
+        Args:
+            page_id: The page to attach to
+            filename: The filename for the attachment
+            data: Raw bytes of the file
+            content_type: MIME type of the file
+            comment: Optional comment for the attachment version
+
+        Returns:
+            Attachment metadata from Confluence
+        """
+        url = self._api_v1(f"content/{page_id}/child/attachment")
+
+        # Check if attachment already exists
+        existing = self._find_attachment(page_id, filename)
+
+        if existing:
+            # Update existing attachment
+            att_id = existing["id"]
+            url = self._api_v1(
+                f"content/{page_id}/child/attachment/{att_id}/data")
+
+        # Must use multipart form, not JSON
+        headers = {"X-Atlassian-Token": "nocheck"}
+        files = {"file": (filename, data, content_type)}
+        form_data = {}
+        if comment:
+            form_data["comment"] = comment
+
+        # Temporarily remove Content-Type header (requests sets it for multipart)
+        saved_ct = self.session.headers.pop("Content-Type", None)
+        try:
+            response = self.session.post(
+                url, files=files, data=form_data, headers=headers)
+            response.raise_for_status()
+            result = response.json()
+            # API returns {"results": [...]} for new, or single object for update
+            if "results" in result:
+                return result["results"][0]
+            return result
+        finally:
+            if saved_ct:
+                self.session.headers["Content-Type"] = saved_ct
+
+    def _find_attachment(self, page_id: str, filename: str) -> Optional[Dict[str, Any]]:
+        """Find an existing attachment by filename."""
+        attachments = self.get_attachments(page_id)
+        for att in attachments:
+            if att.get("title") == filename:
+                return att
+        return None
+
+    # ========== LABEL OPERATIONS ==========
+
+    def get_labels(self, page_id: str) -> List[str]:
+        """
+        Get all labels for a page.
+
+        Returns:
+            List of label name strings
+        """
+        url = self._api_v1(f"content/{page_id}/label")
+        try:
+            response = self.session.get(url)
+            if response.status_code == 404:
+                return []
+            response.raise_for_status()
+            results = response.json().get("results", [])
+            return [label.get("name", "") for label in results if label.get("name")]
+        except Exception:
+            return []
+
+    def set_labels(self, page_id: str, labels: List[str]) -> bool:
+        """
+        Set labels on a page (add missing, remove extra).
+
+        Args:
+            page_id: The page ID
+            labels: Desired list of label names
+
+        Returns:
+            True if labels were synced successfully
+        """
+        current_labels = self.get_labels(page_id)
+        desired = set(labels)
+        current = set(current_labels)
+
+        # Add missing labels
+        to_add = desired - current
+        if to_add:
+            url = self._api_v1(f"content/{page_id}/label")
+            payload = [{"prefix": "global", "name": name} for name in to_add]
+            try:
+                response = self.session.post(url, json=payload)
+                response.raise_for_status()
+            except Exception:
+                return False
+
+        # Remove extra labels
+        to_remove = current - desired
+        for name in to_remove:
+            url = self._api_v1(f"content/{page_id}/label/{name}")
+            try:
+                response = self.session.delete(url)
+                # 404 is fine (label already gone)
+                if response.status_code not in (200, 204, 404):
+                    response.raise_for_status()
+            except Exception:
+                return False
+
+        return True
 
     def get_page_history(self, page_id: str, limit: int = 10) -> List[Dict[str, Any]]:
         """Get version history of a page."""

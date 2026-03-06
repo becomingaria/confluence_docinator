@@ -34,6 +34,7 @@ class PageMetadata:
     web_url: Optional[str] = None
     content_hash: Optional[str] = None
     local_path: Optional[str] = None
+    labels: Optional[List[str]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -47,6 +48,7 @@ class PageMetadata:
             "web_url": self.web_url,
             "content_hash": self.content_hash,
             "local_path": self.local_path,
+            "labels": self.labels or [],
         }
 
     @classmethod
@@ -62,6 +64,7 @@ class PageMetadata:
             web_url=data.get("web_url"),
             content_hash=data.get("content_hash"),
             local_path=data.get("local_path"),
+            labels=data.get("labels", []),
         )
 
 

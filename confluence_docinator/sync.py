@@ -20,7 +20,7 @@ import subprocess
 from .models import PageMetadata, DiffResult, DiffStatus, SyncConfig
 from .client import ConfluenceClient
 from .storage import StorageManager
-from .converter import xhtml_to_markdown, markdown_to_xhtml
+from .converter import xhtml_to_markdown, markdown_to_xhtml, get_referenced_attachments
 
 
 class SyncManager:
@@ -133,6 +133,9 @@ class SyncManager:
                 log(f"    Saved to: {saved_path}")
                 pulled += 1
 
+                # Download attachments (images, files)
+                self._pull_attachments(page_id, saved_path, log)
+
             except Exception as e:
                 errors.append(
                     {"page_id": page_id, "title": title, "error": str(e)})
@@ -168,6 +171,153 @@ class SyncManager:
 
         saved_path = self.storage.save_page(content, metadata, local_path)
         return True, f"Saved to {saved_path}"
+
+    def _pull_attachments(
+        self,
+        page_id: str,
+        page_local_path: str,
+        log: Callable[[str], None] = None,
+    ):
+        """
+        Download all attachments for a page.
+
+        Args:
+            page_id: Confluence page ID
+            page_local_path: Local path of the page file
+            log: Optional logging callback
+        """
+        def _log(msg):
+            if log:
+                log(msg)
+
+        try:
+            attachments = self.client.get_attachments(page_id)
+            if not attachments:
+                return
+
+            for att in attachments:
+                filename = att.get("title", "")
+                att_id = att.get("id", "")
+                download_url = att.get("_links", {}).get("download", "")
+
+                if not filename or not download_url:
+                    continue
+
+                # Check if we need to re-download (version comparison)
+                existing = self.storage.get_attachment_metadata(
+                    page_id, filename)
+                if existing:
+                    att_version = att.get("version", {}).get("number", 1) if isinstance(
+                        att.get("version"), dict) else 1
+                    if existing.get("version", 0) >= att_version:
+                        # Check if local file still exists
+                        local_hash = self.storage.get_local_attachment_hash(
+                            existing.get("local_path", ""))
+                        if local_hash == existing.get("content_hash"):
+                            continue  # Up to date
+
+                # Download
+                try:
+                    data = self.client.download_attachment(download_url)
+                    saved = self.storage.save_attachment(
+                        page_id, filename, data, page_local_path, att)
+                    _log(f"    📎 {filename}")
+                except Exception as e:
+                    _log(f"    ⚠ Attachment error ({filename}): {e}")
+
+        except Exception as e:
+            _log(f"    ⚠ Could not fetch attachments: {e}")
+
+    def _push_attachments(
+        self,
+        page_id: str,
+        page_local_path: str,
+        log: Callable[[str], None] = None,
+    ) -> Tuple[int, int]:
+        """
+        Push modified local attachments back to Confluence.
+
+        Args:
+            page_id: Confluence page ID
+            page_local_path: Local path of the page file
+            log: Optional logging callback
+
+        Returns:
+            Tuple of (pushed_count, error_count)
+        """
+        def _log(msg):
+            if log:
+                log(msg)
+
+        pushed = 0
+        errors = 0
+
+        tracked = self.storage.get_page_attachments(page_id)
+        if not tracked:
+            return 0, 0
+
+        for filename, info in tracked.items():
+            local_path = info.get("local_path", "")
+            stored_hash = info.get("content_hash", "")
+
+            # Check if file was modified
+            current_hash = self.storage.get_local_attachment_hash(local_path)
+            if current_hash is None:
+                continue  # File doesn't exist locally
+
+            if current_hash == stored_hash:
+                continue  # Not modified
+
+            # Push updated attachment
+            try:
+                data = self.storage.read_local_attachment(local_path)
+                if data:
+                    import mimetypes
+                    content_type = mimetypes.guess_type(
+                        filename)[0] or "application/octet-stream"
+                    self.client.upload_attachment(
+                        page_id, filename, data, content_type,
+                        comment="Updated via docinator")
+                    _log(f"    📎 Pushed: {filename}")
+                    pushed += 1
+
+                    # Update stored hash
+                    att_meta = self.storage.get_attachment_metadata(
+                        page_id, filename)
+                    if att_meta:
+                        att_meta["content_hash"] = current_hash
+                        att_meta["version"] = att_meta.get("version", 0) + 1
+                        self.storage._save_attachment_metadata(
+                            page_id, filename, att_meta)
+            except Exception as e:
+                _log(f"    ⚠ Attachment push error ({filename}): {e}")
+                errors += 1
+
+        # Check for new images in _images dir that aren't tracked
+        images_dir = self.storage.get_images_dir(page_local_path)
+        if images_dir.exists():
+            tracked_filenames = set(tracked.keys())
+            for img_file in images_dir.iterdir():
+                if img_file.is_file() and img_file.name not in tracked_filenames:
+                    try:
+                        data = img_file.read_bytes()
+                        import mimetypes
+                        content_type = mimetypes.guess_type(
+                            img_file.name)[0] or "application/octet-stream"
+                        result = self.client.upload_attachment(
+                            page_id, img_file.name, data, content_type,
+                            comment="Added via docinator")
+                        rel_path = str(img_file.relative_to(self.storage.root))
+                        self.storage.save_attachment(
+                            page_id, img_file.name, data, page_local_path, result)
+                        _log(f"    📎 New attachment: {img_file.name}")
+                        pushed += 1
+                    except Exception as e:
+                        _log(
+                            f"    ⚠ New attachment error ({img_file.name}): {e}")
+                        errors += 1
+
+        return pushed, errors
 
     # ========== DIFF OPERATIONS ==========
 
@@ -225,7 +375,7 @@ class SyncManager:
         # Get local content
         local_content = self.storage.read_local_content(local_path)
         local_hash = hashlib.sha256(local_content.encode(
-            'utf-8')).hexdigest() if local_content else None
+            'utf-8')).hexdigest() if local_content is not None else None
 
         # Get remote content (XHTML from Confluence)
         remote_xhtml, remote_metadata = self.client.get_page_content(
@@ -468,6 +618,13 @@ class SyncManager:
                     if success:
                         log(f"  Pushed successfully")
                         pushed += 1
+
+                        # Also push any modified attachments
+                        att_pushed, att_errors = self._push_attachments(
+                            diff_result.page_id, local_path,
+                            log=lambda msg: log(msg))
+                        if att_pushed:
+                            log(f"  Pushed {att_pushed} attachment(s)")
                     else:
                         log(f"  Error: {result_msg}")
                         errors.append(
@@ -532,13 +689,17 @@ class SyncManager:
                 "number", current_version + 1)
             metadata.version = new_version
             metadata.content_hash = hashlib.sha256(
-                content.encode('utf-8')).hexdigest()
+                local_content.encode('utf-8')).hexdigest()
             metadata.last_modified = updated.get("version", {}).get("when", "")
             metadata.last_modified_by = updated.get(
                 "version", {}).get("by", {}).get("displayName", "")
 
             self.storage.save_page(
-                content, metadata, str(Path(local_path).parent))
+                local_content, metadata, str(Path(local_path).parent))
+
+            # Push labels if stored in metadata
+            if metadata.labels is not None:
+                self.client.set_labels(page_id, metadata.labels)
 
             return True, f"Updated to version {new_version}"
 
@@ -665,12 +826,29 @@ class SyncManager:
         conflicts = sum(1 for d in diffs if d.status == DiffStatus.CONFLICT)
         local_only = sum(1 for d in diffs if d.status == DiffStatus.LOCAL_ONLY)
 
+        # Count tracked attachments
+        tracked_attachments = sum(
+            len(atts) for atts in index.get("attachments", {}).values()
+        )
+
+        # Count pages with labels
+        pages_with_labels = 0
+        total_labels = 0
+        for page_id in index.get("pages", {}):
+            meta = self.storage.get_page_metadata(page_id)
+            if meta and meta.labels:
+                pages_with_labels += 1
+                total_labels += len(meta.labels)
+
         return {
             "initialized": True,
             "root_path": str(self.storage.root),
             "target_url": config.get("target_url"),
             "space_key": config.get("space_key"),
             "tracked_pages": tracked_pages,
+            "tracked_attachments": tracked_attachments,
+            "pages_with_labels": pages_with_labels,
+            "total_labels": total_labels,
             "unchanged": unchanged,
             "local_modified": local_modified,
             "remote_modified": remote_modified,
