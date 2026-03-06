@@ -20,6 +20,12 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse, urlunparse
 from dotenv import load_dotenv
+try:
+    import argcomplete
+    from argcomplete.completers import FilesCompleter
+    _ARGCOMPLETE = True
+except ImportError:
+    _ARGCOMPLETE = False
 
 from .models import SyncConfig, DiffStatus
 from .client import ConfluenceClient
@@ -326,6 +332,17 @@ def cmd_diff(args):
     path = args.path if args.path else None
     recursive = args.recursive
 
+    # Helper: make a file path relative to cwd so copy-pasted commands work
+    # from wherever the user ran docinator.
+    cwd = Path.cwd()
+
+    def cwd_path(local_path: str) -> str:
+        abs_path = repo_root / local_path
+        try:
+            return str(abs_path.relative_to(cwd))
+        except ValueError:
+            return str(abs_path)
+
     print("Checking for differences...")
     print()
 
@@ -358,6 +375,24 @@ def cmd_diff(args):
             c = status_colors.get(status, Colors.WHITE)
             print(f"  {color(status.value, c)}: {len(items)}")
 
+        # List changed/conflict files in the summary with ready-to-run commands
+        changed_statuses = [
+            DiffStatus.LOCAL_MODIFIED,
+            DiffStatus.REMOTE_MODIFIED,
+            DiffStatus.CONFLICT,
+        ]
+        changed = [r for r in results if r.status in changed_statuses]
+        if changed and not (args.show_diff or args.git):
+            print()
+            print(
+                color("Changed files (run with --show-diff for inline diff):", Colors.BOLD))
+            for r in changed:
+                p = cwd_path(r.local_path)
+                c = status_colors.get(r.status, Colors.WHITE)
+                print(
+                    f"  {color(r.status.value[0].upper(), c)}  {color(p, Colors.CYAN)}")
+                print(f"       docinator diff \"{p}\" --show-diff")
+
         print()
 
         # Show details for modified/conflict files
@@ -371,7 +406,8 @@ def cmd_diff(args):
             if status in by_status:
                 print(color(f"\n{status.value.upper()}:", Colors.BOLD))
                 for r in by_status[status]:
-                    print(f"\n  {color(r.local_path, Colors.CYAN)}")
+                    p = cwd_path(r.local_path)
+                    print(f"\n  {color(p, Colors.CYAN)}")
                     print(f"    Page: {r.title} (ID: {r.page_id})")
                     print(
                         f"    Local version: {r.local_version}, Remote version: {r.remote_version}")
@@ -402,7 +438,7 @@ def cmd_diff(args):
         if DiffStatus.LOCAL_ONLY in by_status:
             print(color(f"\nUNTRACKED FILES:", Colors.BOLD))
             for r in by_status[DiffStatus.LOCAL_ONLY]:
-                print(f"  {color(r.local_path, Colors.MAGENTA)}")
+                print(f"  {color(cwd_path(r.local_path), Colors.MAGENTA)}")
 
     except Exception as e:
         print(color(f"Error: {e}", Colors.RED))
@@ -778,6 +814,31 @@ CONFLUENCE_EDITOR_VERSION=2
         print("  4. Run: docinator pull <your-confluence-folder-url>")
 
 
+def cmd_completion(args):
+    """Print shell completion activation instructions."""
+    shell = args.shell
+    if shell == "zsh":
+        print(color("Add this line to your ~/.zshrc:", Colors.BOLD))
+        print()
+        print('  eval "$(register-python-argcomplete docinator)"')
+        print()
+        print("Then reload your shell:  source ~/.zshrc")
+    elif shell == "bash":
+        print(color("Add this line to your ~/.bashrc or ~/.bash_profile:", Colors.BOLD))
+        print()
+        print('  eval "$(register-python-argcomplete docinator)"')
+        print()
+        print("Then reload your shell:  source ~/.bashrc")
+    else:
+        print(color("Quick setup (run once):", Colors.BOLD))
+        print()
+        print("  zsh:   echo 'eval \"$(register-python-argcomplete docinator)\"' >> ~/.zshrc && source ~/.zshrc")
+        print("  bash:  echo 'eval \"$(register-python-argcomplete docinator)\"' >> ~/.bashrc && source ~/.bashrc")
+        print()
+        print("After activating, pressing <Tab> after 'docinator diff', 'docinator push',")
+        print("or 'docinator resolve' will complete file paths in your current directory.")
+
+
 def cmd_test(args):
     """Test Confluence connection."""
     config = load_config()
@@ -846,7 +907,7 @@ Examples:
     # push command
     push_parser = subparsers.add_parser(
         "push", help="Push local changes to Confluence")
-    push_parser.add_argument("path", help="File or directory to push")
+    push_path = push_parser.add_argument("path", help="File or directory to push")
     push_parser.add_argument("-m", "--message", help="Version message")
     push_parser.add_argument(
         "-f", "--force", action="store_true", help="Force push even with conflicts")
@@ -855,7 +916,7 @@ Examples:
     # diff command
     diff_parser = subparsers.add_parser(
         "diff", help="Show differences between local and remote")
-    diff_parser.add_argument(
+    diff_path = diff_parser.add_argument(
         "path", nargs="?", help="File or directory to diff (default: all)")
     diff_parser.add_argument("-r", "--recursive", action="store_true",
                              default=True, help="Recursive diff for directories")
@@ -873,11 +934,18 @@ Examples:
 
     # resolve command
     resolve_parser = subparsers.add_parser("resolve", help="Resolve conflicts")
-    resolve_parser.add_argument("path", help="File to resolve")
+    resolve_path = resolve_parser.add_argument("path", help="File to resolve")
     resolve_parser.add_argument("-s", "--strategy", required=True,
                                 choices=["local", "remote", "merge"],
                                 help="Resolution strategy: local (keep yours), remote (use theirs), merge (manual)")
     resolve_parser.set_defaults(func=cmd_resolve)
+
+    # Attach file completers to path arguments (argcomplete)
+    if _ARGCOMPLETE:
+        _fc = FilesCompleter()
+        push_path.completer = _fc
+        diff_path.completer = _fc
+        resolve_path.completer = _fc
 
     # setup command
     setup_parser = subparsers.add_parser(
@@ -888,10 +956,21 @@ Examples:
         help="Confluence URL to pre-fill BASE_URL, SPACE_KEY, and TARGET_URL in example.env")
     setup_parser.set_defaults(func=cmd_setup)
 
+    # completion command
+    completion_parser = subparsers.add_parser(
+        "completion", help="Print shell tab-completion activation instructions")
+    completion_parser.add_argument(
+        "shell", nargs="?", choices=["zsh", "bash"],
+        help="Shell type (default: shows both)")
+    completion_parser.set_defaults(func=cmd_completion)
+
     # test command
     test_parser = subparsers.add_parser(
         "test", help="Test Confluence connection")
     test_parser.set_defaults(func=cmd_test)
+
+    if _ARGCOMPLETE:
+        argcomplete.autocomplete(parser)
 
     args = parser.parse_args()
 
