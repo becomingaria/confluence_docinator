@@ -15,8 +15,10 @@ Usage:
 import os
 import sys
 import argparse
+import re
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse, urlunparse
 from dotenv import load_dotenv
 
 from .models import SyncConfig, DiffStatus
@@ -77,10 +79,31 @@ def load_config() -> SyncConfig:
     return config
 
 
+def _resolve_url(args, storage=None) -> str:
+    """Return the Confluence URL: CLI arg → stored config → CONFLUENCE_TARGET_URL env var."""
+    if getattr(args, 'url', None):
+        return args.url
+    if storage:
+        cfg = storage.get_config()
+        if cfg and cfg.get('target_url'):
+            return cfg['target_url']
+    env_url = os.getenv('CONFLUENCE_TARGET_URL', '')
+    if env_url:
+        return env_url
+    print(color(
+        "Error: No Confluence URL provided.\n"
+        "  Pass it as an argument, or set CONFLUENCE_TARGET_URL in your .env file.",
+        Colors.RED))
+    sys.exit(1)
+
+
 def cmd_init(args):
     """Initialize a new docinator repository."""
     config = load_config()
     client = ConfluenceClient(config)
+
+    # Resolve URL
+    url = _resolve_url(args)
 
     # Test connection
     print("Testing Confluence connection...")
@@ -91,9 +114,9 @@ def cmd_init(args):
     print(color("Connection successful!", Colors.GREEN))
 
     # Parse URL
-    space_key, content_id, content_type = client.parse_confluence_url(args.url)
+    space_key, content_id, content_type = client.parse_confluence_url(url)
     if not content_id:
-        print(color(f"Error: Could not parse URL: {args.url}", Colors.RED))
+        print(color(f"Error: Could not parse URL: {url}", Colors.RED))
         sys.exit(1)
 
     # Get content info
@@ -106,7 +129,7 @@ def cmd_init(args):
     # Set up storage
     output_dir = args.output if args.output else Path.cwd() / "confluence_pages"
     storage = StorageManager(output_dir)
-    storage.initialize(config, args.url, content_id)
+    storage.initialize(config, url, content_id)
 
     print(
         color(f"\nInitialized docinator repository in: {output_dir}", Colors.GREEN))
@@ -114,7 +137,7 @@ def cmd_init(args):
     print(f"Space: {space_key}")
     print(f"\nNext steps:")
     print(f"  cd {output_dir}")
-    print(f"  docinator pull {args.url}")
+    print(f"  docinator pull")
 
 
 def cmd_pull(args):
@@ -141,9 +164,13 @@ def cmd_pull(args):
             output_dir = Path.cwd() / "confluence_pages"
 
     storage = StorageManager(output_dir, content_format=content_format)
+
+    # Resolve URL: CLI arg → stored config → env var
+    url = _resolve_url(args, storage)
+
     sync = SyncManager(client, storage)
 
-    print(f"Pulling from: {args.url}")
+    print(f"Pulling from: {url}")
     print(f"Output: {output_dir}")
     print(f"Format: {content_format}")
     print()
@@ -152,7 +179,7 @@ def cmd_pull(args):
         print(msg)
 
     try:
-        result = sync.pull(args.url, force=args.force,
+        result = sync.pull(url, force=args.force,
                            progress_callback=progress)
 
         print()
@@ -437,6 +464,9 @@ CONFLUENCE_API_KEY=your-api-token-here
 # Default space key (optional, extracted from URLs if not provided)
 CONFLUENCE_SPACE_KEY=YOUR_SPACE
 
+# Target folder URL (optional) - used as default for pull/init when no URL is passed
+# CONFLUENCE_TARGET_URL=https://your-domain.atlassian.net/wiki/spaces/SPACE/folder/123456789
+
 # Editor version (optional, default: 2)
 CONFLUENCE_EDITOR_VERSION=2
 """
@@ -596,11 +626,78 @@ confluence_pages/
 """
 
 
+def _parse_setup_url(url: str) -> dict:
+    """Extract base_url, space_key, and clean target_url from a Confluence URL."""
+    parsed = urlparse(url)
+    # Strip query string / fragment from target URL
+    clean_url = urlunparse(parsed._replace(query="", fragment=""))
+
+    # base_url = scheme + host + /wiki  (handle both /wiki/... and bare host)
+    path = parsed.path
+    wiki_idx = path.find("/wiki")
+    if wiki_idx >= 0:
+        base_path = path[:wiki_idx + len("/wiki")]
+    else:
+        base_path = ""
+    base_url = f"{parsed.scheme}://{parsed.netloc}{base_path}"
+
+    # space key: /spaces/<KEY>/
+    m = re.search(r"/spaces/([^/]+)/", path)
+    space_key = m.group(1) if m else ""
+
+    return {"base_url": base_url, "space_key": space_key, "target_url": clean_url}
+
+
 def cmd_setup(args):
     """Create example.env and README.md in the current directory."""
     cwd = Path.cwd()
+
+    # If a URL was provided, extract values from it
+    extracted = {}
+    if getattr(args, 'url', None):
+        extracted = _parse_setup_url(args.url)
+        print(color(f"Extracted from URL:", Colors.CYAN))
+        print(f"  CONFLUENCE_BASE_URL  = {extracted['base_url']}")
+        print(f"  CONFLUENCE_SPACE_KEY = {extracted['space_key']}")
+        print(f"  CONFLUENCE_TARGET_URL= {extracted['target_url']}")
+        print()
+
+    # Build .env content
+    base_url = extracted.get(
+        'base_url') or 'https://your-domain.atlassian.net/wiki'
+    space_key = extracted.get('space_key') or 'YOUR_SPACE'
+    target_url = extracted.get('target_url') or ''
+    target_line = (
+        f"CONFLUENCE_TARGET_URL={target_url}"
+        if target_url
+        else "# CONFLUENCE_TARGET_URL=https://your-domain.atlassian.net/wiki/spaces/SPACE/folder/123456789"
+    )
+
+    env_content = f"""\
+# Confluence connection
+# Rename / copy this file to .env
+
+# Base URL (ends with /wiki)
+CONFLUENCE_BASE_URL={base_url}
+
+# Your Confluence username (email)
+CONFLUENCE_USERNAME=your.email@yourorganization.com
+
+# API token: https://id.atlassian.com/manage-profile/security/api-tokens
+CONFLUENCE_API_KEY=your-api-token-here
+
+# Space key
+CONFLUENCE_SPACE_KEY={space_key}
+
+# Target folder/page URL — used when running docinator pull with no argument
+{target_line}
+
+# Editor version (default: 2)
+CONFLUENCE_EDITOR_VERSION=2
+"""
+
     files = {
-        "example.env": _SETUP_EXAMPLE_ENV,
+        "example.env": env_content,
         "README.md": _SETUP_README,
     }
 
@@ -617,10 +714,18 @@ def cmd_setup(args):
         print(color(f"  Created {target}", Colors.GREEN))
 
     print()
-    print("Next steps:")
-    print("  1. Copy example.env → .env and fill in your credentials")
-    print("  2. Run: docinator test")
-    print("  3. Run: docinator pull <your-confluence-folder-url>")
+    if extracted:
+        print("Next steps:")
+        print("  1. cp example.env .env")
+        print("  2. Edit .env — fill in CONFLUENCE_USERNAME and CONFLUENCE_API_KEY")
+        print("  3. Run: docinator test")
+        print("  4. Run: docinator pull")
+    else:
+        print("Next steps:")
+        print("  1. cp example.env .env")
+        print("  2. Edit .env — fill in all values")
+        print("  3. Run: docinator test")
+        print("  4. Run: docinator pull <your-confluence-folder-url>")
 
 
 def cmd_test(args):
@@ -648,6 +753,7 @@ def main():
         epilog="""
 Examples:
   docinator setup
+  docinator setup "https://your-domain.atlassian.net/wiki/spaces/SPACE/folder/123456789"
   docinator init https://your-domain.atlassian.net/wiki/spaces/SPACE/folder/123456789
   docinator pull https://your-domain.atlassian.net/wiki/spaces/SPACE/folder/123456789
   docinator status
@@ -663,7 +769,9 @@ Examples:
     # init command
     init_parser = subparsers.add_parser(
         "init", help="Initialize a docinator repository")
-    init_parser.add_argument("url", help="Confluence folder URL to sync")
+    init_parser.add_argument(
+        "url", nargs="?",
+        help="Confluence folder URL (optional if CONFLUENCE_TARGET_URL is set in .env)")
     init_parser.add_argument(
         "-o", "--output", help="Output directory (default: ./confluence_pages)")
     init_parser.add_argument(
@@ -674,7 +782,9 @@ Examples:
     # pull command
     pull_parser = subparsers.add_parser(
         "pull", help="Pull pages from Confluence")
-    pull_parser.add_argument("url", help="Confluence folder URL to pull from")
+    pull_parser.add_argument(
+        "url", nargs="?",
+        help="Confluence folder URL (optional if already initialized or CONFLUENCE_TARGET_URL is set)")
     pull_parser.add_argument("-o", "--output", help="Output directory")
     pull_parser.add_argument(
         "-f", "--force", action="store_true", help="Force overwrite local changes")
@@ -723,6 +833,9 @@ Examples:
     setup_parser = subparsers.add_parser(
         "setup",
         help="Create example.env and README.md in the current directory")
+    setup_parser.add_argument(
+        "url", nargs="?",
+        help="Confluence URL to pre-fill BASE_URL, SPACE_KEY, and TARGET_URL in example.env")
     setup_parser.set_defaults(func=cmd_setup)
 
     # test command
@@ -733,7 +846,7 @@ Examples:
     args = parser.parse_args()
 
     if args.command is None:
-        print(color("Tip: run 'docinator setup' in any directory to create a starter example.env and README.", Colors.CYAN))
+        print(color("Tip: run 'docinator setup <confluence-url>' to create a pre-filled .env and README for your workspace.", Colors.CYAN))
         print()
         parser.print_help()
         sys.exit(0)
