@@ -733,6 +733,8 @@ Examples:
     args = parser.parse_args()
 
     if args.command is None:
+        print(color("Tip: run 'docinator setup' in any directory to create a starter example.env and README.", Colors.CYAN))
+        print()
         parser.print_help()
         sys.exit(0)
 
