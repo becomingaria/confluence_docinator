@@ -271,7 +271,6 @@ def cmd_push(args):
     config = load_config()
     client = ConfluenceClient(config)
 
-    # Create storage and get format from config
     repo_root = _find_repo_root()
     storage = StorageManager(repo_root)
     content_format = storage.get_content_format()
@@ -283,49 +282,98 @@ def cmd_push(args):
         sys.exit(1)
 
     sync = SyncManager(client, storage)
+    cwd = Path.cwd()
 
-    # Normalise path against cwd — handles 'confluence_pages/Foo.md' passed
-    # from a parent directory, where storage.root IS confluence_pages/.
-    push_path = _resolve_path_arg(args.path)
+    def _cwd(p: str) -> str:
+        try:
+            return str((repo_root / p).relative_to(cwd))
+        except ValueError:
+            return p
 
-    print(f"Pushing: {push_path}")
+    # ── Resolve what files to push ─────────────────────────────────────────
+    push_all = getattr(args, 'all', False)
+    dry_run = getattr(args, 'dry_run', False)
+
+    if push_all:
+        diffs = sync.diff()
+        modified = [d for d in diffs if d.status == DiffStatus.LOCAL_MODIFIED]
+        if not modified:
+            print(color("Nothing to push — no locally modified pages.", Colors.GREEN))
+            return
+        push_targets = [str(storage.root / d.local_path) for d in modified]
+        print(
+            f"Pushing {color(str(len(push_targets)), Colors.YELLOW)} modified file(s):")
+        for p in push_targets:
+            print(f"  {_cwd(p.replace(str(storage.root) + '/', ''))}")
+    elif args.path:
+        push_targets = [_resolve_path_arg(args.path)]
+        print(f"Pushing: {push_targets[0]}")
+    else:
+        print(color(
+            "Error: specify a path or use --all to push all modified pages.", Colors.RED))
+        sys.exit(1)
+
     if args.message:
         print(f"Message: {args.message}")
+
+    # ── Dry run ────────────────────────────────────────────────────────────
+    if dry_run:
+        print()
+        print(color("Dry run — no changes sent to Confluence.", Colors.YELLOW))
+        for target in push_targets:
+            print(f"  Would push: {target}")
+        return
+
     print()
 
     def progress(msg):
         print(msg)
 
+    total_pushed = 0
+    total_skipped = 0
+    all_conflicts = []
+    all_errors = []
+
     try:
-        result = sync.push(
-            push_path,
-            message=args.message,
-            force=args.force,
-            progress_callback=progress,
-        )
+        for target in push_targets:
+            result = sync.push(
+                target,
+                message=args.message,
+                force=args.force,
+                progress_callback=progress,
+            )
+            total_pushed += result['pushed']
+            total_skipped += result['skipped']
+            all_conflicts.extend(result.get('conflicts', []))
+            all_errors.extend(result.get('errors', []))
 
         print()
         print(color("=" * 50, Colors.CYAN))
-        print(f"Pushed: {color(str(result['pushed']), Colors.GREEN)}")
-        print(f"Skipped: {result['skipped']}")
+        print(f"Pushed:  {color(str(total_pushed), Colors.GREEN)}")
+        print(f"Skipped: {total_skipped}")
 
-        if result['conflicts']:
+        if all_conflicts:
             print(
-                color(f"\nConflicts: {len(result['conflicts'])}", Colors.YELLOW))
-            for conflict in result['conflicts']:
+                color(f"\nBlocked by conflicts: {len(all_conflicts)} file(s)", Colors.YELLOW))
+            for conflict in all_conflicts:
                 print(f"  - {conflict['local_path']}")
                 print(
                     f"    Remote v{conflict['remote_version']} by {conflict['remote_modified_by']}")
-            print("\nUse 'docinator diff <path>' to see details")
-            print("Use 'docinator resolve <path> --strategy <local|remote>' to resolve")
-            print("Or use 'docinator push <path> --force' to override")
+            print()
+            print("  docinator diff                              # inspect differences")
+            print("  docinator resolve <path> --strategy local   # keep your version")
+            print("  docinator resolve <path> --strategy remote  # accept remote")
+            print("  docinator push <path> --force               # override")
 
-        if result['errors']:
-            print(color(f"\nErrors: {len(result['errors'])}", Colors.RED))
-            for err in result['errors']:
+        if all_errors:
+            print(color(f"\nErrors: {len(all_errors)}", Colors.RED))
+            for err in all_errors:
                 print(f"  - {err['local_path']}: {err['error']}")
 
         print(color("=" * 50, Colors.CYAN))
+
+        if all_conflicts or all_errors:
+            sys.exit(1)
 
     except Exception as e:
         print(color(f"Error: {e}", Colors.RED))
@@ -488,11 +536,19 @@ def cmd_status(args):
     sync = SyncManager(client, storage)
     status = sync.status()
 
+    cwd = Path.cwd()
+
+    def _cwd(local_path: str) -> str:
+        try:
+            return str((repo_root / local_path).relative_to(cwd))
+        except ValueError:
+            return str(repo_root / local_path)
+
     print(color("Docinator Status", Colors.BOLD))
     print(color("=" * 40, Colors.CYAN))
     print(f"Repository: {status['root_path']}")
-    print(f"Target: {status['target_url']}")
-    print(f"Space: {status['space_key']}")
+    print(f"Target:     {status['target_url']}")
+    print(f"Space:      {status['space_key']}")
     print()
     print(f"Tracked pages: {status['tracked_pages']}")
     if status.get('tracked_attachments'):
@@ -504,27 +560,48 @@ def cmd_status(args):
 
     if status['unchanged']:
         print(f"  {color('●', Colors.GREEN)} Unchanged: {status['unchanged']}")
+
     if status['local_modified']:
         print(
             f"  {color('●', Colors.YELLOW)} Local changes: {status['local_modified']}")
+        for f in status.get('local_modified_files', []):
+            p = _cwd(f)
+            print(f"      {color(p, Colors.YELLOW)}")
+            print(f"      → docinator push \"{p}\"")
+
     if status['remote_modified']:
         print(
             f"  {color('●', Colors.CYAN)} Remote changes: {status['remote_modified']}")
+        for f in status.get('remote_modified_files', []):
+            p = _cwd(f)
+            print(f"      {color(p, Colors.CYAN)}")
+            print(f"      → docinator pull")
+
     if status['conflicts']:
         print(f"  {color('●', Colors.RED)} Conflicts: {status['conflicts']}")
+        for f in status.get('conflict_files', []):
+            p = _cwd(f)
+            print(f"      {color(p, Colors.RED)}")
+            print(f"      → docinator resolve \"{p}\" --strategy local|remote")
+
     if status['untracked']:
         print(
-            f"  {color('●', Colors.MAGENTA)} Untracked: {status['untracked']}")
+            f"  {color('●', Colors.MAGENTA)} Untracked (not in Confluence): {status['untracked']}")
+        for f in status.get('untracked_files', []):
+            p = _cwd(f)
+            print(f"      {color(p, Colors.MAGENTA)}")
+            print(f"      → docinator create \"{p}\"")
 
     print()
 
-    if status['local_modified']:
-        print("Use 'docinator push <path>' to upload local changes")
-    if status['remote_modified']:
-        print("Use 'docinator pull <url>' to download remote changes")
-    if status['conflicts']:
-        print("Use 'docinator diff' to see conflicts")
-        print("Use 'docinator resolve <path> --strategy <local|remote>' to resolve")
+    if not any([status['local_modified'], status['remote_modified'],
+                status['conflicts'], status['untracked']]):
+        print(color("Everything is in sync.", Colors.GREEN))
+    else:
+        if status['remote_modified']:
+            print("Run 'docinator pull' to download remote changes.")
+        if status['conflicts']:
+            print("Run 'docinator diff' to inspect conflicts.")
 
 
 def cmd_resolve(args):
@@ -929,9 +1006,9 @@ def cmd_new(args):
     except ValueError:
         rel_path = str(file_path)
 
-    print(color(f"Created local file: {file_path}", Colors.GREEN))
+    print(color(f"Created: {file_path}", Colors.GREEN))
 
-    if not args.no_create:
+    if getattr(args, 'publish', False):
         sync = SyncManager(client, storage)
         parent_path = args.parent if args.parent else None
         success, msg, url = sync.create_new_page(
@@ -948,8 +1025,8 @@ def cmd_new(args):
             print(f"  File saved locally. Run:")
             print(f'  docinator create "{rel_path}"')
     else:
-        print(
-            f"  Run 'docinator create \"{rel_path}\"' when ready to publish.")
+        print(f"  Edit the file, then run:")
+        print(f'  docinator create "{rel_path}"')
 
 
 def cmd_create(args):
@@ -1052,10 +1129,16 @@ Examples:
     push_parser = subparsers.add_parser(
         "push", help="Push local changes to Confluence")
     push_path = push_parser.add_argument(
-        "path", help="File or directory to push")
+        "path", nargs="?", help="File or directory to push")
     push_parser.add_argument("-m", "--message", help="Version message")
     push_parser.add_argument(
         "-f", "--force", action="store_true", help="Force push even with conflicts")
+    push_parser.add_argument(
+        "--all", action="store_true",
+        help="Push all locally modified pages (no path required)")
+    push_parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Show what would be pushed without sending anything to Confluence")
     push_parser.set_defaults(func=cmd_push)
 
     # diff command
@@ -1099,9 +1182,9 @@ Examples:
         metavar="DIR",
         help="Local directory to create the .md file in (overrides --parent location)")
     new_parser.add_argument(
-        "--no-create",
+        "--publish",
         action="store_true",
-        help="Only create the local file — don't publish to Confluence yet")
+        help="Immediately publish the new page to Confluence (default: local file only)")
     new_parser.set_defaults(func=cmd_new)
 
     # create command: publish an existing local file as a new Confluence page

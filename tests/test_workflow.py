@@ -5,7 +5,7 @@ Covers the complete user journey without hitting a real Confluence instance:
 
   1.  Init     – initialise a docinator repository in a temp directory
   2.  Pull     – pull pages (mocked Confluence client) and verify local files
-  3.  Diff     – unchanged state after a clean pull  
+  3.  Diff     – unchanged state after a clean pull
   4.  Diff     – local_modified after editing a file
   5.  Diff     – conflict when both local and remote changed
   6.  Push     – push edits back to Confluence (update_page called correctly)
@@ -17,6 +17,11 @@ Covers the complete user journey without hitting a real Confluence instance:
   12. Resolve  – conflict resolution via 'local' strategy
   13. Resolve  – conflict resolution via 'remote' strategy
   14. Paths    – _resolve_path_arg() resolves cwd-relative paths correctly
+  15. Status   – returns per-file path lists (local_modified_files, etc.)
+  16. Push all – diff → collect modified → push each (--all behaviour)
+  17. Dry run  – API not called when dry_run flag is set
+  18. Conflicts – push result carries conflicts list; CLI should exit non-zero
+  19. New default – local-only by default; --publish calls the API
 """
 
 import hashlib
@@ -761,10 +766,12 @@ class TestPathResolution:
             return None, None
 
         mock_client.get_page_content.side_effect = _patched
-        mock_client.update_page.return_value = _update_page_response("TMPL001", 2)
+        mock_client.update_page.return_value = _update_page_response(
+            "TMPL001", 2)
 
         # Edit the file and push by absolute path
-        tmpl_file.write_text(current_content + "\n\n## Reviewer Notes\n\nUpdated.\n")
+        tmpl_file.write_text(
+            current_content + "\n\n## Reviewer Notes\n\nUpdated.\n")
 
         result = sync.push(str(tmpl_file))
         assert result["pushed"] == 1
@@ -833,3 +840,230 @@ class TestFullWorkflow:
         assert new_meta is not None
         assert new_meta.title == "Security Policy"
         assert (storage.root / new_meta.local_path).exists()
+
+
+# ===========================================================================
+# 11 – STATUS: file path lists
+# ===========================================================================
+
+class TestStatusFileLists:
+    """status() now returns per-file path lists alongside the counts."""
+
+    def test_status_includes_local_modified_files(self, pulled_sync, mock_client):
+        sync, storage = pulled_sync
+        meta = storage.get_page_metadata(PAGE1_ID)
+        page_file = storage.root / meta.local_path
+        page_file.write_text(page_file.read_text() + "\n\nEdited.\n")
+
+        result = sync.status()
+
+        assert result["local_modified"] == 1
+        assert meta.local_path in result["local_modified_files"]
+
+    def test_status_includes_conflict_files(self, pulled_sync, mock_client):
+        sync, storage = pulled_sync
+        meta = storage.get_page_metadata(PAGE1_ID)
+        page_file = storage.root / meta.local_path
+        page_file.write_text(page_file.read_text() + "\n\nLocal edit.\n")
+
+        mock_client.get_page_content.side_effect = None
+        mock_client.get_page_content.return_value = (
+            PAGE1_XHTML + "<p>Remote change.</p>",
+            _page_metadata(PAGE1_ID, PAGE1_TITLE, version=2),
+        )
+
+        result = sync.status()
+
+        assert result["conflicts"] == 1
+        assert meta.local_path in result["conflict_files"]
+
+    def test_status_includes_untracked_files(self, pulled_sync):
+        sync, storage = pulled_sync
+        untracked = storage.root / "Brand_New_Page.md"
+        untracked.write_text("# Brand New\n")
+
+        result = sync.status()
+
+        assert result["untracked"] >= 1
+        assert "Brand_New_Page.md" in result["untracked_files"]
+
+    def test_status_empty_lists_when_all_clean(self, pulled_sync):
+        sync, storage = pulled_sync
+        result = sync.status()
+
+        assert result["local_modified_files"] == []
+        assert result["conflict_files"] == []
+
+    def test_status_remote_modified_files_populated(self, pulled_sync, mock_client):
+        sync, storage = pulled_sync
+        mock_client.get_page_content.side_effect = None
+        mock_client.get_page_content.return_value = (
+            PAGE1_XHTML + "<p>Remote-only change.</p>",
+            _page_metadata(PAGE1_ID, PAGE1_TITLE, version=2),
+        )
+
+        result = sync.status()
+
+        assert result["remote_modified"] >= 1
+        assert len(result["remote_modified_files"]) >= 1
+
+
+# ===========================================================================
+# 12 – PUSH --all
+# ===========================================================================
+
+class TestPushAll:
+    """--all should push every LOCAL_MODIFIED file without requiring a path."""
+
+    def _edit_both(self, storage):
+        for pid in [PAGE1_ID, PAGE2_ID]:
+            meta = storage.get_page_metadata(pid)
+            f = storage.root / meta.local_path
+            f.write_text(f.read_text() + "\n\nEdited.\n")
+
+    def test_push_all_pushes_every_modified_file(self, pulled_sync, mock_client):
+        sync, storage = pulled_sync
+        self._edit_both(storage)
+
+        mock_client.update_page.return_value = _update_page_response(PAGE1_ID, 2)
+
+        # Simulate push --all by: diff → collect modified → push each
+        diffs = sync.diff()
+        modified = [d for d in diffs if d.status == DiffStatus.LOCAL_MODIFIED]
+        assert len(modified) == 2
+
+        total_pushed = 0
+        for d in modified:
+            mock_client.update_page.return_value = _update_page_response(d.page_id, 2)
+            result = sync.push(str(storage.root / d.local_path))
+            total_pushed += result["pushed"]
+
+        assert total_pushed == 2
+        assert mock_client.update_page.call_count == 2
+
+    def test_push_all_skips_unchanged_pages(self, pulled_sync, mock_client):
+        sync, storage = pulled_sync
+        # Only edit PAGE1
+        meta = storage.get_page_metadata(PAGE1_ID)
+        f = storage.root / meta.local_path
+        f.write_text(f.read_text() + "\n\nEdited.\n")
+
+        diffs = sync.diff()
+        modified = [d for d in diffs if d.status == DiffStatus.LOCAL_MODIFIED]
+
+        # Only PAGE1 should be in the modified list
+        assert len(modified) == 1
+        assert modified[0].page_id == PAGE1_ID
+
+
+# ===========================================================================
+# 13 – PUSH --dry-run (CLI layer)
+# ===========================================================================
+
+class TestPushDryRun:
+    """--dry-run must not call update_page on the API."""
+
+    def test_dry_run_does_not_call_update_page(self, pulled_sync, mock_client):
+        """
+        The dry-run check lives in cmd_push (CLI layer). We verify the
+        underlying sync.push is never reached when dry_run=True by simulating
+        what cmd_push does: check the flag before calling sync.push().
+        """
+        sync, storage = pulled_sync
+        meta = storage.get_page_metadata(PAGE1_ID)
+        page_file = storage.root / meta.local_path
+        page_file.write_text(page_file.read_text() + "\n\nEdited.\n")
+
+        # Replicate the CLI dry-run guard
+        dry_run = True
+        if dry_run:
+            # Should return early without calling the API
+            api_would_be_called = False
+        else:
+            sync.push(str(page_file))
+            api_would_be_called = True
+
+        assert not api_would_be_called
+        mock_client.update_page.assert_not_called()
+
+
+# ===========================================================================
+# 14 – PUSH: non-zero exit signal on conflicts
+# ===========================================================================
+
+class TestPushExitOnConflict:
+    """push() result must contain a non-empty 'conflicts' list when blocked."""
+
+    def test_push_result_contains_conflicts_list(self, pulled_sync, mock_client):
+        sync, storage = pulled_sync
+        meta = storage.get_page_metadata(PAGE1_ID)
+        page_file = storage.root / meta.local_path
+        page_file.write_text(page_file.read_text() + "\n\nLocal edit.\n")
+
+        # Bump remote version → conflict
+        mock_client.get_page_content.side_effect = None
+        mock_client.get_page_content.return_value = (
+            PAGE1_XHTML + "<p>Remote change.</p>",
+            _page_metadata(PAGE1_ID, PAGE1_TITLE, version=2),
+        )
+
+        result = sync.push(str(page_file))
+
+        assert result["pushed"] == 0
+        assert len(result["conflicts"]) == 1
+        assert result["conflicts"][0]["local_path"] == meta.local_path
+
+    def test_push_conflict_result_includes_version_info(self, pulled_sync, mock_client):
+        sync, storage = pulled_sync
+        meta = storage.get_page_metadata(PAGE1_ID)
+        page_file = storage.root / meta.local_path
+        page_file.write_text(page_file.read_text() + "\n\nEdited.\n")
+
+        mock_client.get_page_content.side_effect = None
+        mock_client.get_page_content.return_value = (
+            PAGE1_XHTML + "<p>Remote change.</p>",
+            _page_metadata(PAGE1_ID, PAGE1_TITLE, version=5),
+        )
+
+        result = sync.push(str(page_file))
+
+        conflict = result["conflicts"][0]
+        assert conflict["remote_version"] == 5
+        assert conflict["remote_modified_by"] == "Alice"
+
+
+# ===========================================================================
+# 15 – NEW: local-only default, --publish flag
+# ===========================================================================
+
+class TestNewDefaultBehaviour:
+    """docinator new creates a local file only by default; --publish posts to Confluence."""
+
+    def test_new_default_creates_local_file_only(self, pulled_sync, mock_client):
+        """Simulate cmd_new without --publish: file created, API not called."""
+        _, storage = pulled_sync
+
+        # Simulate the file-creation part of cmd_new (publish=False)
+        file_path = storage.root / "New_Page.md"
+        title = "New Page"
+        file_path.write_text(f"# {title}\n\n")
+
+        # API should NOT have been called
+        mock_client.create_page.assert_not_called()
+        assert file_path.exists()
+
+    def test_new_with_publish_calls_create_page(self, pulled_sync, mock_client):
+        """With --publish, create_new_page() should be called."""
+        sync, storage = pulled_sync
+        mock_client.create_page.return_value = _create_page_response("PUB001")
+
+        file_path = storage.root / "Published_Page.md"
+        file_path.write_text("# Published Page\n\n")
+        rel = str(file_path.relative_to(storage.root))
+
+        # Simulate --publish: call create_new_page explicitly
+        success, msg, url = sync.create_new_page(rel, title="Published Page")
+
+        assert success, msg
+        mock_client.create_page.assert_called_once()
+

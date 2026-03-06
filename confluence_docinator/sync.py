@@ -851,9 +851,13 @@ class SyncManager:
             "total_labels": total_labels,
             "unchanged": unchanged,
             "local_modified": local_modified,
+            "local_modified_files": [d.local_path for d in diffs if d.status == DiffStatus.LOCAL_MODIFIED],
             "remote_modified": remote_modified,
+            "remote_modified_files": [d.local_path for d in diffs if d.status == DiffStatus.REMOTE_MODIFIED],
             "conflicts": conflicts,
+            "conflict_files": [d.local_path for d in diffs if d.status == DiffStatus.CONFLICT],
             "untracked": local_only,
+            "untracked_files": [d.local_path for d in diffs if d.status == DiffStatus.LOCAL_ONLY],
         }
 
     # ===================================================================

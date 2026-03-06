@@ -7,11 +7,16 @@ pull / diff / push workflow for documentation management.
 
 - **Pull** – Download all pages from a Confluence folder, maintaining hierarchy
 - **Push** – Upload local changes back to Confluence (with version messages)
+- **Push all** – `--all` to push every locally-modified page in one command
+- **Dry run** – `--dry-run` on any push to preview changes before sending
 - **Diff** – Compare local files against Confluence before pushing
 - **Resolve** – Handle conflicts between local and remote changes
-- **Status** – See a summary of local vs. remote state at a glance
+- **Status** – See every changed file by name with ready-to-copy commands
+- **New** – Scaffold a new `.md` file locally, then publish with `create`
+- **Create** – Push a local file to Confluence as a brand-new page
 - **Labels** – Pull and sync Confluence page labels automatically
 - **Macros** – Preserve Confluence-specific macro content through round-trips
+- **Tab completion** – Shell completion for all commands and file paths
 
 ## Installation
 
@@ -50,6 +55,17 @@ cp example.env .env
 
 1. Go to https://id.atlassian.com/manage-profile/security/api-tokens
 2. Click **Create API token**, give it a name, and copy the value into `.env`.
+
+### Environment Variables
+
+| Variable                    | Required | Description                                       |
+| --------------------------- | -------- | ------------------------------------------------- |
+| `CONFLUENCE_BASE_URL`       | ✅       | Your instance URL, ending with `/wiki`            |
+| `CONFLUENCE_USERNAME`       | ✅       | Your Confluence email address                     |
+| `CONFLUENCE_API_KEY`        | ✅       | API token from the link above                     |
+| `CONFLUENCE_SPACE_KEY`      | ✓        | Space key — extracted from URL automatically      |
+| `CONFLUENCE_TARGET_URL`     | —        | Default folder URL used when no URL arg is passed |
+| `CONFLUENCE_EDITOR_VERSION` | —        | Confluence editor version (default: `2`)          |
 
 ---
 
@@ -132,6 +148,8 @@ Upload local changes to Confluence:
 docinator push path/to/Page.md
 docinator push path/to/Page.md -m "Updated API documentation"
 docinator push path/to/folder/
+docinator push --all                # push every locally-modified page
+docinator push path/to/Page.md --dry-run   # preview without sending
 docinator push path/to/Page.md --force     # override conflicts
 ```
 
@@ -147,6 +165,48 @@ docinator resolve path/to/Page.md --strategy merge   # manual merge file
 
 ---
 
+### `docinator new`
+
+Scaffold a new `.md` file locally. Does not touch Confluence until you run
+`create`.
+
+```bash
+docinator new "Security Policy"               # creates Security Policy.md in cwd
+docinator new "Access Review" --dir Security/ # place in a specific subfolder
+docinator new "Draft" --publish               # scaffold AND publish immediately
+```
+
+### `docinator create`
+
+Publish an existing local `.md` file as a brand-new Confluence page:
+
+```bash
+docinator create Security/Security_Policy.md
+docinator create orphan.md --parent Security/Overview.md
+docinator create my_file.md --title "Human Readable Title"
+```
+
+Parent page is auto-discovered from sibling pages in the same directory.
+Override with `--parent path/to/Parent.md`.
+
+### `docinator completion`
+
+Print shell tab-completion setup instructions:
+
+```bash
+docinator completion       # shows both zsh and bash instructions
+docinator completion zsh   # zsh only
+docinator completion bash  # bash only
+```
+
+For zsh, add this line once to `~/.zshrc`:
+
+```bash
+eval "$(register-python-argcomplete docinator)"
+```
+
+---
+
 ## Typical Workflow
 
 ```bash
@@ -157,22 +217,30 @@ cp example.env .env   # fill in credentials
 
 # 2. Pull documentation from Confluence
 docinator pull "https://your-domain.atlassian.net/wiki/spaces/SPACE/folder/123456789"
+# After the first pull, re-sync with just:
+docinator pull
 
 # 3. Edit files locally
 code confluence_pages/
 
 # 4. Review changes
-docinator status
-docinator diff path/to/Page.md --show-diff
+docinator status                                  # see every changed file by name
+docinator diff path/to/Page.md --show-diff        # inline diff
 
-# 5. Check for remote changes before pushing
-docinator diff
+# 5. Preview before pushing
+docinator push --all --dry-run
 
 # 6. Resolve any conflicts
 docinator resolve path/to/Page.md --strategy local
 
 # 7. Push changes back
-docinator push path/to/Page.md -m "Updated documentation"
+docinator push --all -m "Sprint 42 doc updates"  # push everything modified
+docinator push path/to/Page.md -m "Single page"  # or just one file
+
+# 8. Add a new page
+docinator new "Runbook: Deployment"
+# edit the scaffolded file, then:
+docinator create confluence_pages/Runbook_Deployment.md
 ```
 
 ---
