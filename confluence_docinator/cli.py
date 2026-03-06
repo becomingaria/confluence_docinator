@@ -79,6 +79,52 @@ def load_config() -> SyncConfig:
     return config
 
 
+def _find_repo_root(start: Path = None) -> Path:
+    """Find the docinator repo root (.confluence/config.json) from the given start dir.
+
+    Search order:
+      1. start dir itself
+      2. confluence_pages/ subdirectory (common convention)
+      3. Any other direct subdirectory containing .confluence/
+      4. Parent directories (up to 5 levels)
+
+    Returns the repo root Path if found, otherwise the start dir (caller handles
+    the "not initialized" error via is_initialized()).
+    """
+    if start is None:
+        start = Path.cwd()
+
+    config_file = ".confluence/config.json"
+
+    # 1. Current directory
+    if (start / config_file).exists():
+        return start
+
+    # 2. confluence_pages/ subdirectory first (most common)
+    candidate = start / "confluence_pages"
+    if (candidate / config_file).exists():
+        return candidate
+
+    # 3. Any other immediate subdirectory
+    try:
+        for child in start.iterdir():
+            if child.is_dir() and child.name not in (".git", ".confluence") and (child / config_file).exists():
+                return child
+    except PermissionError:
+        pass
+
+    # 4. Walk up parent directories
+    check = start.parent
+    for _ in range(5):
+        if check == check.parent:
+            break
+        if (check / config_file).exists():
+            return check
+        check = check.parent
+
+    return start  # fallback — is_initialized() will report the error
+
+
 def _resolve_url(args, storage=None) -> str:
     """Return the Confluence URL: CLI arg → stored config → CONFLUENCE_TARGET_URL env var."""
     if getattr(args, 'url', None):
@@ -152,10 +198,10 @@ def cmd_pull(args):
     if args.output:
         output_dir = Path(args.output)
     else:
-        # Check if we're in an initialized repo
-        storage = StorageManager(Path.cwd(), content_format=content_format)
+        repo_root = _find_repo_root()
+        storage = StorageManager(repo_root, content_format=content_format)
         if storage.is_initialized():
-            output_dir = Path.cwd()
+            output_dir = repo_root
             # Use the format from existing config
             existing_config = storage.get_config()
             if existing_config:
@@ -203,9 +249,10 @@ def cmd_push(args):
     client = ConfluenceClient(config)
 
     # Create storage and get format from config
-    storage = StorageManager(Path.cwd())
+    repo_root = _find_repo_root()
+    storage = StorageManager(repo_root)
     content_format = storage.get_content_format()
-    storage = StorageManager(Path.cwd(), content_format=content_format)
+    storage = StorageManager(repo_root, content_format=content_format)
 
     if not storage.is_initialized():
         print(color(
@@ -264,9 +311,10 @@ def cmd_diff(args):
     client = ConfluenceClient(config)
 
     # Create storage and get format from config
-    storage = StorageManager(Path.cwd())
+    repo_root = _find_repo_root()
+    storage = StorageManager(repo_root)
     content_format = storage.get_content_format()
-    storage = StorageManager(Path.cwd(), content_format=content_format)
+    storage = StorageManager(repo_root, content_format=content_format)
 
     if not storage.is_initialized():
         print(color(
@@ -369,9 +417,10 @@ def cmd_status(args):
     client = ConfluenceClient(config)
 
     # Create storage and get format from config
-    storage = StorageManager(Path.cwd())
+    repo_root = _find_repo_root()
+    storage = StorageManager(repo_root)
     content_format = storage.get_content_format()
-    storage = StorageManager(Path.cwd(), content_format=content_format)
+    storage = StorageManager(repo_root, content_format=content_format)
 
     if not storage.is_initialized():
         print(color("Not a docinator repository.", Colors.YELLOW))
@@ -426,9 +475,10 @@ def cmd_resolve(args):
     client = ConfluenceClient(config)
 
     # Create storage and get format from config
-    storage = StorageManager(Path.cwd())
+    repo_root = _find_repo_root()
+    storage = StorageManager(repo_root)
     content_format = storage.get_content_format()
-    storage = StorageManager(Path.cwd(), content_format=content_format)
+    storage = StorageManager(repo_root, content_format=content_format)
 
     if not storage.is_initialized():
         print(color("Error: Not a docinator repository.", Colors.RED))
